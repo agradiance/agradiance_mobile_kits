@@ -1,17 +1,20 @@
 import 'dart:async';
 import 'dart:io' show Platform;
 
-import 'package:agradiance_mobile_kits/src/updates/custom_app_update_modal_sheet.dart';
 import 'package:flutter/services.dart' show PlatformException;
 import 'package:in_app_update_flutter/in_app_update_flutter.dart';
 import 'package:material_ui/material_ui.dart';
 
-enum DisplayMode { dialog, bottomSheet }
-
-/// flexible  = downloads in background, user keeps using the app
-/// immediate = full-screen blocking flow (for critical updates)
+/// flexible  = Play's own prompt, then the download runs in the background
+///             while the user keeps using the app
+/// immediate = Play's own full-screen flow (for critical updates)
 enum AppUpdateType { flexible, immediate }
 
+/// Updates through Google Play's in-app update flow. All the update screens
+/// (the consent prompt and the full-screen immediate flow) are Play's own, so
+/// this app shows no update dialog or sheet of its own. The only app UI left
+/// is a snack bar for results Play doesn't show, such as "up to date" and
+/// "update downloaded, restart".
 class AppUpdateService {
   AppUpdateService._internal();
 
@@ -22,6 +25,9 @@ class AppUpdateService {
   }
 
   final InAppUpdateFlutter plugin = InAppUpdateFlutter();
+
+  StreamSubscription<InstallStateAndroid>? _installSub;
+  bool _running = false;
 
   /// In-app updates via Google Play only exist on Android.
   bool get isSupported => Platform.isAndroid;
@@ -80,42 +86,106 @@ class AppUpdateService {
     }
   }
 
+  /// Checks Play for an update and, if there is one, hands over to Play's own
+  /// update UI.
+  ///
+  /// With [notifyWhenUpToDate] (use it for a manual "Check for updates" tap)
+  /// a short message is shown when there is nothing to install or the check
+  /// fails. Without it, an automatic check stays silent in those cases.
+  Future<void> checkAndUpdate({
+    required BuildContext context,
+    bool notifyWhenUpToDate = false,
+    AppUpdateType updateType = AppUpdateType.flexible,
+  }) async {
+    if (_running) return;
+    _running = true;
+
+    // Taken now, because the screen may be gone by the time a download finishes.
+    final messenger = ScaffoldMessenger.maybeOf(context);
+
+    void say(
+      String message, {
+      SnackBarAction? action,
+      Duration duration = const Duration(seconds: 4),
+    }) {
+      messenger
+        ?..hideCurrentSnackBar()
+        ..showSnackBar(
+          SnackBar(content: Text(message), action: action, duration: duration),
+        );
+    }
+
+    try {
+      if (!isSupported) {
+        if (notifyWhenUpToDate)
+          say('Updates through Google Play are only available on Android.');
+        return;
+      }
+
+      final info = await checkForUpdate();
+      if (info == null) {
+        if (notifyWhenUpToDate)
+          say("Couldn't check for updates. Please try again later.");
+        return;
+      }
+      if (!canUpdate(info)) {
+        if (notifyWhenUpToDate) say("You're up to date.");
+        return;
+      }
+
+      // Listen before starting, so the "downloaded" event can't be missed.
+      final flexible =
+          updateType == AppUpdateType.flexible && info.isFlexibleUpdateAllowed;
+      if (flexible) {
+        await _installSub?.cancel();
+        _installSub = installStates.listen((state) {
+          if (state.status == InstallStatusAndroid.downloaded) {
+            _installSub?.cancel();
+            _installSub = null;
+            say(
+              'An update has been downloaded.',
+              duration: const Duration(days: 1),
+              action: SnackBarAction(
+                label: 'Restart',
+                onPressed: completeUpdate,
+              ),
+            );
+          }
+        });
+      }
+
+      // Play shows its own prompt here. For an immediate update it also takes
+      // over the screen and restarts the app when it finishes.
+      final result = await startUpdate(info, type: updateType);
+
+      if (result == UpdateResultAndroid.success) {
+        if (flexible) say('Downloading the update in the background.');
+      } else {
+        await _installSub?.cancel();
+        _installSub = null;
+        if (result == UpdateResultAndroid.inAppUpdateFailed) {
+          say("The update couldn't be started. Please try again.");
+        } else if (result == null && notifyWhenUpToDate) {
+          say("An update isn't available right now.");
+        }
+        // Otherwise the user declined Play's prompt, which needs no message.
+      }
+    } finally {
+      _running = false;
+    }
+  }
+
+  /// Kept so existing calls still work. It no longer shows an app dialog: it
+  /// runs [checkAndUpdate], which uses Play's own update UI.
   Future<void> showUpdateDialog({
     required BuildContext context,
     required bool showWhenUptodate,
-    DisplayMode displayMode = DisplayMode.dialog,
     AppUpdateType updateType = AppUpdateType.flexible,
-    String? releaseNotes,
-  }) async {
-    AppUpdateInfoAndroid? info;
-
-    if (!showWhenUptodate) {
-      info = await checkForUpdate();
-      if (!canUpdate(info)) return;
-    }
-
-    // ignore: use_build_context_synchronously
-    if (!context.mounted) return;
-
-    final sheet = CustomAppUpdateModalSheet(
-      updateInfo: info,
+  }) {
+    return checkAndUpdate(
+      context: context,
+      notifyWhenUpToDate: showWhenUptodate,
       updateType: updateType,
-      releaseNotes: releaseNotes,
     );
-
-    if (displayMode == DisplayMode.bottomSheet) {
-      await showModalBottomSheet(
-        isScrollControlled: true,
-        shape: const RoundedRectangleBorder(),
-        context: context,
-        builder: (context) => PopScope(canPop: false, child: sheet),
-      );
-    } else {
-      await showDialog(
-        context: context,
-        builder: (context) =>
-            PopScope(canPop: false, child: AlertDialog(content: sheet)),
-      );
-    }
   }
 }

@@ -81,5 +81,4 @@ export 'src/widgets/theme_icon_button.dart';
 export 'src/widgets/visibility_detector_view.dart';
 
 export 'src/updates/app_update_service.dart';
-export 'src/updates/custom_app_update_modal_sheet.dart';
 export 'src/services/local_notification_service.dart';
